@@ -43,7 +43,7 @@ VAPID_PUBLIC_KEY = "ISI_SETELAH_GENERATE_VAPID"
 VAPID_PRIVATE_KEY_PATH = os.path.join(APP_DIR, "vapid_private.pem")
 VAPID_CLAIMS_SUB = "mailto:ganti@dengan-email-kamu.com"
 
-CRON_KUNCI = "ganti-dengan-kata-sandi-acak-punya-sendiri"
+CRON_KUNCI = "22102000"
 # --------------------------------------------------
 
 
