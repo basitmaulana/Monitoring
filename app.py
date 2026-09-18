@@ -39,7 +39,7 @@ app = Flask(__name__)
 AERODATABOX_API_KEY = "44e5aa0765msh8f56735bdbcf1fcp1a2250jsn43d85ca9934c"
 AERODATABOX_HOST = "aerodatabox.p.rapidapi.com"
 
-VAPID_PUBLIC_KEY = "ISI_SETELAH_GENERATE_VAPID"
+VAPID_PUBLIC_KEY = "BBFSK1qtWbVTACECJenEE9rig7_MbekM9kkJwc7uW0o3ijqUXBDZPZb3t95qwfyjwbubic1EbULG5PKbT73dbuM"
 VAPID_PRIVATE_KEY_PATH = os.path.join(APP_DIR, "vapid_private.pem")
 VAPID_CLAIMS_SUB = "mailto:ganti@dengan-email-kamu.com"
 
