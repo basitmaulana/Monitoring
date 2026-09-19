@@ -43,6 +43,10 @@ VAPID_PUBLIC_KEY = "BBFSK1qtWbVTACECJenEE9rig7_MbekM9kkJwc7uW0o3ijqUXBDZPZb3t95q
 VAPID_PRIVATE_KEY_PATH = os.path.join(APP_DIR, "vapid_private.pem")
 VAPID_CLAIMS_SUB = "mailto:ganti@dengan-email-kamu.com"
 
+# PENTING: saya gak pernah lihat nilai asli kunci cron kamu (cuma nyuruh
+# kamu isi sendiri), jadi WAJIB kamu isi manual di bawah ini pakai kata
+# sandi yang SAMA PERSIS dengan yang sudah kamu daftarkan di cron-job.org
+# -- kalau beda, endpoint cron bakal ditolak (403).
 CRON_KUNCI = "22102000"
 # --------------------------------------------------
 
@@ -173,11 +177,14 @@ def _kirim_payload(subscription_info, payload_json):
         return True
 
 
-def kirim_push(entri, judul, isi, penting=True):
-    """penting=True -> notifikasi 'tegas' (bunyi/getar), dipakai pas landing.
+def kirim_push(entri, judul, isi, penting=True, hanya_standby=False):
+    """penting=True -> notifikasi 'tegas' (bunyi/getar), dipakai pas landing
+    atau dibatalkan -- ini SELALU dikirim ke semua device, gak peduli
+    toggle standby-nya nyala/mati.
     penting=False -> notifikasi 'diam-diam' yang MENIMPA notifikasi lama
-    (tag sama), dipakai buat update berkala (estimasi berubah dsb) supaya
-    status bar-nya kelihatan 'hidup' terus tanpa nge-spam bunyi tiap 5 menit."""
+    (tag sama), dipakai buat update berkala.
+    hanya_standby=True -> lewati device yang toggle standby-nya DIMATIKAN
+    (device itu cuma mau dikabari pas landing/dibatalkan aja)."""
     payload = json.dumps({
         "title": judul,
         "body": isi,
@@ -187,6 +194,9 @@ def kirim_push(entri, judul, isi, penting=True):
 
     sisa = []
     for sub in entri.get("push_subscriptions", []):
+        if hanya_standby and not sub.get("standby", True):
+            sisa.append(sub)  # skip sesuai preferensi device, subscription tetap disimpan
+            continue
         if _kirim_payload(sub, payload):
             sisa.append(sub)
     entri["push_subscriptions"] = sisa
@@ -317,6 +327,7 @@ def api_flights_hapus(flight_id):
 def api_flights_subscribe(flight_id):
     body = request.get_json(force=True, silent=True) or {}
     subscription = body.get("subscription")
+    standby = bool(body.get("standby", True))
     if not subscription or not subscription.get("endpoint"):
         return jsonify({"ok": False, "pesan": "Data subscription tidak valid."}), 400
 
@@ -326,11 +337,18 @@ def api_flights_subscribe(flight_id):
         return jsonify({"ok": False, "pesan": "Penerbangan tidak ditemukan."}), 404
 
     daftar = entri.setdefault("push_subscriptions", [])
-    if not any(s.get("endpoint") == subscription["endpoint"] for s in daftar):
-        daftar.append(subscription)
+    sudah_ada = next((s for s in daftar if s.get("endpoint") == subscription["endpoint"]), None)
+
+    if sudah_ada:
+        sudah_ada["standby"] = standby
         save_flights(data)
-        if entri.get("status") == "aktif":
-            kirim_push_ke_satu_subscription(subscription, entri)
+    else:
+        subscription_baru = dict(subscription)
+        subscription_baru["standby"] = standby
+        daftar.append(subscription_baru)
+        save_flights(data)
+        if entri.get("status") == "aktif" and standby:
+            kirim_push_ke_satu_subscription(subscription_baru, entri)
 
     return jsonify({"ok": True})
 
@@ -396,12 +414,15 @@ def api_cron_cek():
             # bikin notifikasi kelihatan "standby"/hidup terus di status bar
             # selama flight masih dipantau. Tetap "diam" (gak bunyi/getar),
             # cuma nimpa isi notifikasi lama (tag sama di service worker).
+            # Device yang toggle standby-nya DIMATIKAN dilewati di sini --
+            # mereka cuma bakal dikabari nanti pas landing/dibatalkan.
             if entri.get("tiba_estimasi"):
                 kirim_push(
                     entri,
                     judul=f"{entri['nomor']} sedang dipantau",
                     isi=f"Estimasi tiba: {entri.get('tiba_estimasi')}{catatan_sumber}",
                     penting=False,
+                    hanya_standby=True,
                 )
 
         berubah = True
