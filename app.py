@@ -17,6 +17,7 @@
 
 from flask import Flask, render_template, request, jsonify, send_from_directory
 import json
+import math
 import os
 import uuid
 import requests
@@ -96,9 +97,11 @@ def rapikan_data_flight(f):
     berangkat = f.get("departure") or {}
     tiba = f.get("arrival") or {}
     airline = f.get("airline") or {}
+    aircraft = f.get("aircraft") or {}
 
     kualitas_tiba = tiba.get("quality") or []
     tiba_live = "Live" in kualitas_tiba
+    lokasi_tiba = (tiba.get("airport") or {}).get("location") or {}
 
     return {
         "maskapai": airline.get("name") or "",
@@ -113,11 +116,87 @@ def rapikan_data_flight(f):
         "tiba_estimasi": _ambil_waktu(tiba, "predictedTime", "revisedTime", "scheduledTime"),
         "tiba_aktual": _ambil_waktu(tiba, "actualTime", "runwayTime"),
         "tiba_live": tiba_live,
+        "aircraft_icao24": aircraft.get("modeS") or "",
+        "tiba_lat": lokasi_tiba.get("lat"),
+        "tiba_lon": lokasi_tiba.get("lon"),
     }
 
 
+# ---------------- live tracking (OpenSky Network, gratis, tanpa API key) ----------------
+def jarak_km(lat1, lon1, lat2, lon2):
+    """Jarak garis lurus antar 2 koordinat bumi (haversine), dalam km."""
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def ambil_posisi_radar(icao24):
+    """Tanya posisi terakhir 1 pesawat ke OpenSky Network pakai kode modeS-nya.
+    Return dict {lat, lon, kecepatan_mps} kalau pesawatnya lagi kejejak
+    beneran (dan bukan lagi di darat), None kalau gak ada datanya."""
+    if not icao24:
+        return None
+    try:
+        r = requests.get(
+            "https://opensky-network.org/api/states/all",
+            params={"icao24": icao24.strip().lower()},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print("Gagal panggil OpenSky:", e)
+        return None
+
+    states = data.get("states")
+    if not states:
+        return None
+
+    s = states[0]
+    # urutan field sesuai dokumentasi OpenSky "state vector"
+    lon, lat = s[5], s[6]
+    di_darat = s[8]
+    kecepatan = s[9]  # meter/detik
+
+    if di_darat or lat is None or lon is None or not kecepatan or kecepatan < 20:
+        return None
+
+    return {"lat": lat, "lon": lon, "kecepatan_mps": kecepatan}
+
+
+def perkaya_dengan_radar(hasil):
+    """Kalau posisi live-nya ketemu di OpenSky, timpa estimasi tiba yang
+    dari AeroDataBox dengan hitungan (jarak sisa / kecepatan sekarang) --
+    ini yang bikin angkanya jauh lebih dekat ke kondisi asli (mirip FR24).
+    Gagal/gak ketemu -> diam-diam pakai estimasi lama, gak error."""
+    icao24 = hasil.get("aircraft_icao24")
+    lat_tujuan = hasil.get("tiba_lat")
+    lon_tujuan = hasil.get("tiba_lon")
+    if not icao24 or lat_tujuan is None or lon_tujuan is None:
+        return hasil
+
+    posisi = ambil_posisi_radar(icao24)
+    if not posisi:
+        return hasil
+
+    jarak = jarak_km(posisi["lat"], posisi["lon"], lat_tujuan, lon_tujuan)
+    kecepatan_kmh = posisi["kecepatan_mps"] * 3.6
+    if kecepatan_kmh < 50:
+        return hasil
+
+    sisa_jam = jarak / kecepatan_kmh
+    eta = datetime.now(timezone.utc) + timedelta(hours=sisa_jam)
+    hasil["tiba_estimasi"] = eta.strftime("%Y-%m-%d %H:%M:%S") + "Z"
+    hasil["tiba_live"] = True
+    return hasil
+
+
 def cari_status_flight(nomor, tanggal):
-    """Panggil AeroDataBox buat 1 nomor+tanggal penerbangan.
+    """Panggil AeroDataBox buat 1 nomor+tanggal penerbangan, lalu coba
+    perkaya dengan posisi live dari OpenSky kalau ada.
     Return dict data yang sudah dirapikan, atau None kalau gagal/nihil."""
     nomor = nomor.strip().upper().replace(" ", "")
     url = f"https://{AERODATABOX_HOST}/flights/number/{nomor}/{tanggal}"
@@ -138,7 +217,8 @@ def cari_status_flight(nomor, tanggal):
     if not hasil or not isinstance(hasil, list) or len(hasil) == 0:
         return None
 
-    return rapikan_data_flight(hasil[0])
+    data_rapi = rapikan_data_flight(hasil[0])
+    return perkaya_dengan_radar(data_rapi)
 
 
 def sudah_landing(status_mentah, data):
