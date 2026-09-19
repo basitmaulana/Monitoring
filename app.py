@@ -16,6 +16,8 @@
 # ============================================================
 
 from flask import Flask, render_template, request, jsonify, send_from_directory
+import contextlib
+import fcntl
 import json
 import math
 import os
@@ -53,20 +55,60 @@ CRON_KUNCI = "22102000"
 
 
 # ---------------- penyimpanan data (file JSON) ----------------
+LOCK_FILE = os.path.join(DATA_DIR, ".flights.lock")
+
+
+@contextlib.contextmanager
+def kunci_data(blocking=True):
+    """Pastikan cuma 1 proses yang boleh baca-ubah-simpan flights.json
+    di satu waktu. Tanpa ini, 2 request yang kebetulan nimpuk (misal kamu
+    trigger cron manual barengan cron-job.org lagi jalan) bisa bikin file
+    datanya rusak/ketimpa setengah-setengah.
+    blocking=False -> kalau lagi dikunci proses lain, LANGSUNG nyerah
+    (yield False) alih-alih nunggu -- dipakai di endpoint cron biar gak
+    numpuk request kalau kebetulan ada 2 pengecekan bentrok."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(LOCK_FILE, "w") as f:
+        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(f, flags)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+    """Coba baca file utama; kalau rusak/gagal parse, coba baca cadangan
+    (.bak) sebelum benar-benar nyerah ke nilai default."""
+    for kandidat in (path, path + ".bak"):
+        if not os.path.exists(kandidat):
+            continue
+        try:
+            with open(kandidat, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Gagal baca {kandidat}:", e)
+    return default
 
 
 def save_json(path, data):
+    """Nulis aman: ke file sementara dulu, baru diganti (atomic) -- kalau
+    proses keputus di tengah jalan, file lama tetap utuh. Sebelum ditimpa,
+    versi lama disalin dulu ke .bak sebagai cadangan."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    if os.path.exists(path):
+        try:
+            os.replace(path, path + ".bak")
+        except Exception:
+            pass
+    os.replace(tmp_path, path)
 
 
 def load_flights():
@@ -75,6 +117,7 @@ def load_flights():
 
 def save_flights(data):
     save_json(FLIGHTS_FILE, data)
+
 
 
 # ---------------- panggil AeroDataBox ----------------
@@ -346,14 +389,16 @@ def api_flights_tambah():
     if not nomor:
         return jsonify({"ok": False, "pesan": "Nomor penerbangan wajib diisi."}), 400
 
-    data = load_flights()
-
-    sudah_ada = next((f for f in data if f["nomor"] == nomor and f["tanggal"] == tanggal), None)
+    with kunci_data():
+        data = load_flights()
+        sudah_ada = next((f for f in data if f["nomor"] == nomor and f["tanggal"] == tanggal), None)
     if sudah_ada:
         salinan = dict(sudah_ada)
         salinan.pop("push_subscriptions", None)
         return jsonify({"ok": True, "data": salinan, "pesan": "Penerbangan ini sudah dipantau."})
 
+    # panggil API di LUAR kunci -- ini yang paling lama (network), jangan
+    # sampai nahan proses lain nunggu cuma gara-gara ini
     hasil = cari_status_flight(nomor, tanggal)
     if not hasil:
         return jsonify({
@@ -385,8 +430,16 @@ def api_flights_tambah():
         "sudah_notif_landing": status_awal == "landed",
         "push_subscriptions": [],
     }
-    data.append(entri)
-    save_flights(data)
+
+    with kunci_data():
+        data = load_flights()  # baca ulang versi terbaru, siapa tau berubah
+        sudah_ada2 = next((f for f in data if f["nomor"] == nomor and f["tanggal"] == tanggal), None)
+        if sudah_ada2:
+            salinan = dict(sudah_ada2)
+            salinan.pop("push_subscriptions", None)
+            return jsonify({"ok": True, "data": salinan, "pesan": "Penerbangan ini sudah dipantau."})
+        data.append(entri)
+        save_flights(data)
 
     salinan = dict(entri)
     salinan.pop("push_subscriptions", None)
@@ -395,11 +448,12 @@ def api_flights_tambah():
 
 @app.route("/api/flights/<flight_id>", methods=["DELETE"])
 def api_flights_hapus(flight_id):
-    data = load_flights()
-    baru = [f for f in data if f["id"] != flight_id]
-    if len(baru) == len(data):
-        return jsonify({"ok": False, "pesan": "Data tidak ditemukan."}), 404
-    save_flights(baru)
+    with kunci_data():
+        data = load_flights()
+        baru = [f for f in data if f["id"] != flight_id]
+        if len(baru) == len(data):
+            return jsonify({"ok": False, "pesan": "Data tidak ditemukan."}), 404
+        save_flights(baru)
     return jsonify({"ok": True})
 
 
@@ -411,24 +465,31 @@ def api_flights_subscribe(flight_id):
     if not subscription or not subscription.get("endpoint"):
         return jsonify({"ok": False, "pesan": "Data subscription tidak valid."}), 400
 
-    data = load_flights()
-    entri = next((f for f in data if f["id"] == flight_id), None)
-    if not entri:
-        return jsonify({"ok": False, "pesan": "Penerbangan tidak ditemukan."}), 404
+    kirim_notif_awal = None
 
-    daftar = entri.setdefault("push_subscriptions", [])
-    sudah_ada = next((s for s in daftar if s.get("endpoint") == subscription["endpoint"]), None)
+    with kunci_data():
+        data = load_flights()
+        entri = next((f for f in data if f["id"] == flight_id), None)
+        if not entri:
+            return jsonify({"ok": False, "pesan": "Penerbangan tidak ditemukan."}), 404
 
-    if sudah_ada:
-        sudah_ada["standby"] = standby
+        daftar = entri.setdefault("push_subscriptions", [])
+        sudah_ada = next((s for s in daftar if s.get("endpoint") == subscription["endpoint"]), None)
+
+        if sudah_ada:
+            sudah_ada["standby"] = standby
+        else:
+            subscription_baru = dict(subscription)
+            subscription_baru["standby"] = standby
+            daftar.append(subscription_baru)
+            if entri.get("status") == "aktif" and standby:
+                kirim_notif_awal = (subscription_baru, dict(entri))
+
         save_flights(data)
-    else:
-        subscription_baru = dict(subscription)
-        subscription_baru["standby"] = standby
-        daftar.append(subscription_baru)
-        save_flights(data)
-        if entri.get("status") == "aktif" and standby:
-            kirim_push_ke_satu_subscription(subscription_baru, entri)
+
+    # push (network call) dikirim SETELAH lepas kunci
+    if kirim_notif_awal:
+        kirim_push_ke_satu_subscription(*kirim_notif_awal)
 
     return jsonify({"ok": True})
 
@@ -441,83 +502,90 @@ def api_cron_cek():
     if request.args.get("kunci", "") != CRON_KUNCI:
         return jsonify({"ok": False, "pesan": "Kunci salah."}), 403
 
-    data = load_flights()
-    dicek = 0
-    berubah = False
+    with kunci_data(blocking=False) as dapat_kunci:
+        if not dapat_kunci:
+            # ada pengecekan lain yang masih jalan (mis. cron-job.org &
+            # trigger manual nimpuk barengan) -- dilewati, BUKAN dipaksa
+            # jalan bareng, biar file datanya gak rusak
+            return jsonify({"ok": True, "pesan": "Pengecekan sebelumnya masih berjalan, dilewati.", "dicek": 0})
 
-    for entri in data:
-        if entri.get("status") in ("landed", "cancelled"):
-            continue
+        data = load_flights()
+        dicek = 0
+        berubah = False
 
-        hasil = cari_status_flight(entri["nomor"], entri["tanggal"])
-        dicek += 1
-        if not hasil:
-            continue
+        for entri in data:
+            if entri.get("status") in ("landed", "cancelled"):
+                continue
 
-        status_sebelum = entri.get("status")
+            hasil = cari_status_flight(entri["nomor"], entri["tanggal"])
+            dicek += 1
+            if not hasil:
+                continue
 
-        entri["maskapai"] = hasil["maskapai"] or entri.get("maskapai")
-        entri["asal"] = hasil["asal"] or entri.get("asal")
-        entri["tujuan"] = hasil["tujuan"] or entri.get("tujuan")
-        entri["berangkat_dijadwalkan"] = hasil["berangkat_dijadwalkan"] or entri.get("berangkat_dijadwalkan")
-        entri["berangkat_aktual"] = hasil["berangkat_aktual"] or entri.get("berangkat_aktual")
-        entri["tiba_dijadwalkan"] = hasil["tiba_dijadwalkan"] or entri.get("tiba_dijadwalkan")
-        entri["tiba_estimasi"] = hasil["tiba_estimasi"] or entri.get("tiba_estimasi")
-        entri["tiba_aktual"] = hasil["tiba_aktual"] or entri.get("tiba_aktual")
-        entri["tiba_live"] = hasil.get("tiba_live", entri.get("tiba_live", False))
-        entri["terakhir_dicek"] = datetime.now(timezone.utc).isoformat()
+            status_sebelum = entri.get("status")
 
-        catatan_sumber = "" if entri["tiba_live"] else " (berdasarkan jadwal, belum live)"
+            entri["maskapai"] = hasil["maskapai"] or entri.get("maskapai")
+            entri["asal"] = hasil["asal"] or entri.get("asal")
+            entri["tujuan"] = hasil["tujuan"] or entri.get("tujuan")
+            entri["berangkat_dijadwalkan"] = hasil["berangkat_dijadwalkan"] or entri.get("berangkat_dijadwalkan")
+            entri["berangkat_aktual"] = hasil["berangkat_aktual"] or entri.get("berangkat_aktual")
+            entri["tiba_dijadwalkan"] = hasil["tiba_dijadwalkan"] or entri.get("tiba_dijadwalkan")
+            entri["tiba_estimasi"] = hasil["tiba_estimasi"] or entri.get("tiba_estimasi")
+            entri["tiba_aktual"] = hasil["tiba_aktual"] or entri.get("tiba_aktual")
+            entri["tiba_live"] = hasil.get("tiba_live", entri.get("tiba_live", False))
+            entri["terakhir_dicek"] = datetime.now(timezone.utc).isoformat()
 
-        if sudah_landing(hasil["status_mentah"], hasil):
-            entri["status"] = "landed"
-            if not entri.get("sudah_notif_landing"):
-                kirim_push(
-                    entri,
-                    judul=f"{entri['nomor']} sudah mendarat",
-                    isi=f"{entri.get('asal') or '?'} -> {entri.get('tujuan') or '?'}",
-                    penting=True,
-                )
-                entri["sudah_notif_landing"] = True
-        elif sudah_cancel(hasil["status_mentah"]):
-            entri["status"] = "cancelled"
-            if status_sebelum != "cancelled":
-                kirim_push(
-                    entri,
-                    judul=f"{entri['nomor']} dibatalkan",
-                    isi=f"{entri.get('asal') or '?'} -> {entri.get('tujuan') or '?'}",
-                    penting=True,
-                )
-        else:
-            entri["status"] = "aktif"
-            # dikirim TIAP siklus cron (bukan cuma pas berubah) -- ini yang
-            # bikin notifikasi kelihatan "standby"/hidup terus di status bar
-            # selama flight masih dipantau. Tetap "diam" (gak bunyi/getar),
-            # cuma nimpa isi notifikasi lama (tag sama di service worker).
-            # Device yang toggle standby-nya DIMATIKAN dilewati di sini --
-            # mereka cuma bakal dikabari nanti pas landing/dibatalkan.
-            if entri.get("tiba_estimasi"):
-                kirim_push(
-                    entri,
-                    judul=f"{entri['nomor']} sedang dipantau",
-                    isi=f"Estimasi tiba: {entri.get('tiba_estimasi')}{catatan_sumber}",
-                    penting=False,
-                    hanya_standby=True,
-                )
+            catatan_sumber = "" if entri["tiba_live"] else " (berdasarkan jadwal, belum live)"
 
-        berubah = True
+            if sudah_landing(hasil["status_mentah"], hasil):
+                entri["status"] = "landed"
+                if not entri.get("sudah_notif_landing"):
+                    kirim_push(
+                        entri,
+                        judul=f"{entri['nomor']} sudah mendarat",
+                        isi=f"{entri.get('asal') or '?'} -> {entri.get('tujuan') or '?'}",
+                        penting=True,
+                    )
+                    entri["sudah_notif_landing"] = True
+            elif sudah_cancel(hasil["status_mentah"]):
+                entri["status"] = "cancelled"
+                if status_sebelum != "cancelled":
+                    kirim_push(
+                        entri,
+                        judul=f"{entri['nomor']} dibatalkan",
+                        isi=f"{entri.get('asal') or '?'} -> {entri.get('tujuan') or '?'}",
+                        penting=True,
+                    )
+            else:
+                entri["status"] = "aktif"
+                # dikirim TIAP siklus cron (bukan cuma pas berubah) -- ini
+                # yang bikin notifikasi kelihatan "standby"/hidup terus di
+                # status bar selama flight masih dipantau. Tetap "diam"
+                # (gak bunyi/getar), cuma nimpa isi notifikasi lama (tag
+                # sama di service worker). Device yang toggle standby-nya
+                # DIMATIKAN dilewati -- cuma dikabari pas landing/dibatalkan.
+                if entri.get("tiba_estimasi"):
+                    kirim_push(
+                        entri,
+                        judul=f"{entri['nomor']} sedang dipantau",
+                        isi=f"Estimasi tiba: {entri.get('tiba_estimasi')}{catatan_sumber}",
+                        penting=False,
+                        hanya_standby=True,
+                    )
 
-    # beres-beres data lama (lebih dari 3 hari) biar file gak numpuk
-    batas = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-    sebelum = len(data)
-    data = [f for f in data if f["tanggal"] >= batas]
-    if len(data) != sebelum:
-        berubah = True
+            berubah = True
 
-    if berubah:
-        save_flights(data)
+        # beres-beres data lama (lebih dari 3 hari) biar file gak numpuk
+        batas = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        sebelum = len(data)
+        data = [f for f in data if f["tanggal"] >= batas]
+        if len(data) != sebelum:
+            berubah = True
 
-    return jsonify({"ok": True, "dicek": dicek, "total": len(data)})
+        if berubah:
+            save_flights(data)
+
+        return jsonify({"ok": True, "dicek": dicek, "total": len(data)})
 
 
 if __name__ == "__main__":
